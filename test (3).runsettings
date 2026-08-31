@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!--
+  SMART Security Automation - test.runsettings
+
+  This file is NOT committed to the repo (see .gitignore: *.runsettings).
+  Each machine/agent needs its own copy. Place it at the solution root
+  (next to SmartSecurityTestAutomation.sln) or anywhere convenient, then:
+
+  Visual Studio:  Test menu -> Configure Run Settings
+                  -> Select Solution Wide runsettings File -> pick this file.
+
+  CLI:            dotnet test --settings test.runsettings
+
+  Every <EnvironmentVariables> entry below is read via
+  Environment.GetEnvironmentVariable(...) in the code. Replace the
+  placeholder values (REPLACE_ME) before running. Do not commit real
+  secrets (PatKey, SelfProvisionXApiKey) back into source control.
+-->
+<RunSettings>
+  <RunConfiguration>
+    <EnvironmentVariables>
+
+      <!-- REQUIRED. Selects AppSettings/appsettings.{Environment}.json.
+           Valid values: dev | qa | qasbx | prod
+           TestMaster.LoadRuntimeParameters() throws if this is missing. -->
+      <Environment>qa</Environment>
+
+      <!-- REQUIRED. Azure DevOps Personal Access Token (Test Plans read/write).
+           TestMaster.LoadRuntimeParameters() throws if this is missing. -->
+      <PatKey>REPLACE_ME</PatKey>
+
+      <!-- ADO result reporting (teardown: UpdateAdoResults2 / GenerateHTMLReport).
+           Needed if you want test outcomes written back to Azure DevOps.
+           Organization is the ADO org name (e.g. the {org} in dev.azure.com/{org}). -->
+      <Organization>REPLACE_ME</Organization>
+      <AdoProject>REPLACE_ME</AdoProject>
+      <AdoTestPlan>REPLACE_ME</AdoTestPlan>
+
+      <!-- Self-service / self-provisioning API calls
+           (x-api-key header in MasterApi.PostSelfServiceRequest).
+           Required only for tests that hit the self-provisioning endpoints. -->
+      <SelfProvisionXApiKey>REPLACE_ME</SelfProvisionXApiKey>
+
+      <!-- Login credentials for the demo test (read by LoginDemoTests).
+           These OVERRIDE the DefaultUser from securityUsers.qa.json when set.
+           Plain text on disk — this file is git-ignored, so do NOT commit it.
+           XML-escape special characters in the password:
+             &  -> &amp;    <  -> &lt;    >  -> &gt;
+           (^ | = / : ) @ and most others are fine as-is.) -->
+      <TestUserName>HTNASVCTSTAUT51</TestUserName>
+      <TestPassword>REPLACE_ME</TestPassword>
+
+      <!-- Legacy / currently commented out in code. Kept here for reference;
+           uncomment if that code path is re-enabled.
+      <MailinatorAppKey>REPLACE_ME</MailinatorAppKey>
+      <AdoBaseUrl>REPLACE_ME</AdoBaseUrl>
+      -->
+
+    </EnvironmentVariables>
+  </RunConfiguration>
+</RunSettings>
