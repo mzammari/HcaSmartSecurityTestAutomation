@@ -1,0 +1,10 @@
+$root   = Split-Path $dte.Solution.FullName
+$major  = (Get-Item "C:\Program Files\Google\Chrome\Application\chrome.exe").VersionInfo.ProductVersion.Split('.')[0]
+$feed   = Invoke-RestMethod "https://googlechromelabs.github.io/chrome-for-testing/latest-versions-per-milestone-with-downloads.json"
+$url    = ($feed.milestones."$major".downloads.chromedriver | Where-Object { $_.platform -eq 'win64' }).url
+$zip    = "$env:TEMP\chromedriver-win64.zip"
+Invoke-WebRequest $url -OutFile $zip
+Expand-Archive $zip "$env:TEMP\cft" -Force
+$target = Get-ChildItem $root -Recurse -Filter chromedriver.exe | Where-Object { $_.FullName -notmatch '\\(bin|obj)\\' } | Select-Object -First 1 -ExpandProperty FullName
+Copy-Item "$env:TEMP\cft\chromedriver-win64\chromedriver.exe" $target -Force
+& $target --version
