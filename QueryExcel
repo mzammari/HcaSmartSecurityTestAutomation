@@ -1,0 +1,135 @@
+/// <summary>
+        /// Query an Excel file: find rows where searchColumn = searchValue,
+        /// return all specified columns for each matching row.
+        /// Uses decimal for exact precision — no rounding.
+        /// 
+        /// Usage:
+        ///   var columns = ExcelParser.ToList("Jan, Feb, Mar, Apr, May, Jun, Jul, Aug, Sep, Oct, Nov, Dec, Total");
+        ///   var results = ExcelParser.QueryExcel(
+        ///       "Report.xls",
+        ///       columns,
+        ///       searchColumn: "Department",
+        ///       searchValue: "504"
+        ///   );
+        ///   
+        ///   decimal jan = results["Employed (Productive) FTEs:"]["Jan"];
+        ///   decimal total = results["Contract FTEs"]["Total"];
+        /// </summary>
+        public static Dictionary<string, Dictionary<string, decimal>> QueryExcel(
+            string fileLocation,
+            List<string> columns,
+            string searchColumn,
+            string searchValue,
+            string sheetName = null,
+            int headerRow = 0)
+        {
+            var table = ExcelHeaderDiscovery.ReadSheet(fileLocation, sheetName);
+            var headers = ExcelHeaderDiscovery.GetHeaders(table, headerRow);
+            int detectedHeaderRow = headers.Values.FirstOrDefault()?.HeaderRow ?? 0;
+
+            // Find the search column
+            var searchCol = headers.Values.FirstOrDefault(h =>
+                h.HeaderName.Equals(searchColumn, StringComparison.OrdinalIgnoreCase));
+
+            if (searchCol == null)
+                throw new KeyNotFoundException($"Search column '{searchColumn}' not found. " +
+                    $"Available: {string.Join(", ", headers.Values.Select(h => h.HeaderName))}");
+
+            // Find the row key column (first column that isn't the search column and isn't in the columns list)
+            int keyColIndex = -1;
+            foreach (var h in headers.Values.OrderBy(h => h.ColumnIndex))
+            {
+                bool isSearchCol = h.ColumnIndex == searchCol.ColumnIndex;
+                bool isDataCol = columns.Any(c => c.Equals(h.HeaderName, StringComparison.OrdinalIgnoreCase));
+                if (!isSearchCol && !isDataCol)
+                {
+                    keyColIndex = h.ColumnIndex;
+                    break;
+                }
+            }
+
+            if (keyColIndex < 0) keyColIndex = 0;
+
+            // Map requested columns to their positions
+            var columnMap = new List<(string Name, int ColIndex)>();
+            foreach (var col in columns)
+            {
+                var colInfo = headers.Values.FirstOrDefault(h =>
+                    h.HeaderName.Equals(col, StringComparison.OrdinalIgnoreCase));
+
+                if (colInfo != null)
+                    columnMap.Add((col, colInfo.ColumnIndex));
+                else
+                    Console.WriteLine($"Warning: Column '{col}' not found in Excel.");
+            }
+
+            // Scan rows: find matching criteria, return entire row
+            var result = new Dictionary<string, Dictionary<string, decimal>>(StringComparer.OrdinalIgnoreCase);
+
+            for (int row = detectedHeaderRow + 1; row < table.Rows.Count; row++)
+            {
+                string cellValue = table.Rows[row][searchCol.ColumnIndex]?.ToString()?.Trim();
+                if (!searchValue.Equals(cellValue, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                string rowKey = table.Rows[row][keyColIndex]?.ToString()?.Trim();
+                if (string.IsNullOrWhiteSpace(rowKey))
+                    continue;
+
+                var rowData = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (name, colIndex) in columnMap)
+                {
+                    object cellObj = table.Rows[row][colIndex];
+                    rowData[name] = ConvertToDecimal(cellObj);
+                }
+
+                // Handle duplicate row keys
+                string uniqueKey = rowKey;
+                if (result.ContainsKey(uniqueKey))
+                {
+                    int suffix = 2;
+                    while (result.ContainsKey($"{rowKey}_{suffix}"))
+                        suffix++;
+                    uniqueKey = $"{rowKey}_{suffix}";
+                }
+
+                result[uniqueKey] = rowData;
+            }
+
+            if (result.Count == 0)
+                Console.WriteLine($"Warning: No rows found where '{searchColumn}' = '{searchValue}'");
+            else
+                Console.WriteLine($"Found {result.Count} rows where '{searchColumn}' = '{searchValue}'");
+
+            return result;
+        }
+
+        private static decimal ConvertToDecimal(object cellObj)
+        {
+            if (cellObj == null || cellObj == DBNull.Value)
+                return 0m;
+
+            if (cellObj is decimal dec) return dec;
+            if (cellObj is double d) return (decimal)d;
+            if (cellObj is int i) return i;
+            if (cellObj is long l) return l;
+            if (cellObj is float f) return (decimal)f;
+
+            string text = cellObj.ToString()?.Trim();
+            if (string.IsNullOrWhiteSpace(text)) return 0m;
+
+            // Percentage: "52%" -> 0.52
+            if (text.EndsWith("%"))
+            {
+                string numPart = text.TrimEnd('%').Trim();
+                if (decimal.TryParse(numPart, out decimal pctValue))
+                    return pctValue / 100m;
+            }
+
+            // Currency/formatted: "$1,234.56"
+            string cleaned = text.Replace("$", "").Replace(",", "").Trim();
+            if (decimal.TryParse(cleaned, out decimal parsed))
+                return parsed;
+
+            return 0m;
+        }
