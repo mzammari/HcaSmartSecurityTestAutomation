@@ -1,0 +1,314 @@
+#region Using declarations
+using System;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+// NinjaTrader 8 — SignalAlert, two-timeframe match
+//
+// Put this on a 5-minute chart. It adds a 30-minute series in the background.
+//
+// Signal rules (same on both timeframes, all must be true):
+//   LONG : Close > SMA(20) AND ROC(12) > 0 AND RSI(14) > 50 AND Volume >= previous bar
+//   SHORT: Close < SMA(20) AND ROC(12) < 0 AND RSI(14) < 50 AND Volume >= previous bar
+// Each timeframe alternates on its own: a LONG can only fire after a SHORT, and vice versa.
+//
+// Flow:
+//   1. A 30-min LONG fires -> 30-min bias = LONG (diamond on the chart).
+//      The bias stays LONG until a 30-min SHORT fires.
+//   2. While the bias is LONG, every new 5-min LONG signal -> match arrow + alert (once per 5-min signal).
+//      5-min SHORT signals during a LONG bias are not alerted; they just reset the 5-min side,
+//      so the next 5-min LONG counts as a new match.
+//   3. When the 30-min bias first turns LONG, the first 5-min bar with all LONG conditions true
+//      matches right away (even if the 5-min was already in a LONG state).
+//   Shorts are the mirror image.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+    public class SignalAlertMTF : Indicator
+    {
+        // 5-min (primary) indicators
+        private SMA sma5;
+        private ROC roc5;
+        private RSI rsi5;
+
+        // 30-min (secondary) indicators
+        private SMA smaHtf;
+        private ROC rocHtf;
+        private RSI rsiHtf;
+
+        private int htfBias        = 0;  // current 30-min bias: 1 long, -1 short, 0 none yet
+        private int ltfLastSignal  = 0;  // last 5-min signal: 1 long, -1 short, 0 none (reset on new 30-min bias)
+        private int pendingHtfMark = 0;  // draw the 30-min marker on the next 5-min bar
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description         = "SMA/ROC/RSI/Volume signal: alerts on every 5-min signal that matches the current 30-min signal direction.";
+                Name                = "SignalAlertMTF";
+                Calculate           = Calculate.OnBarClose;
+                IsOverlay           = true;
+                IsAutoScale         = false;   // keep the 0/1/-1 plots from squashing the price scale
+                DisplayInDataBox    = false;
+                PaintPriceMarkers   = false;
+                IsSuspendedWhileInactive = false;
+
+                HigherTFMinutes       = 30;
+                SmaPeriod             = 20;
+                RocPeriod             = 12;
+                RsiPeriod             = 14;
+                ShowBiasBackground    = true;
+                AlertOnHigherTFSignal = false;
+                AlertOnHistorical     = false;
+                AlertSound            = "Alert2.wav";
+
+                // Plots for Market Analyzer columns (transparent on charts)
+                AddPlot(Brushes.Transparent, "Bias");   // 1 = 30m long bias, -1 = 30m short bias, 0 = none yet
+                AddPlot(Brushes.Transparent, "Match");  // 1 = match long on this bar, -1 = match short, 0 = no match
+            }
+            else if (State == State.Configure)
+            {
+                AddDataSeries(BarsPeriodType.Minute, HigherTFMinutes);
+            }
+            else if (State == State.DataLoaded)
+            {
+                sma5   = SMA(Close, SmaPeriod);
+                roc5   = ROC(Close, RocPeriod);
+                rsi5   = RSI(Close, RsiPeriod, 3);
+
+                smaHtf = SMA(Closes[1], SmaPeriod);
+                rocHtf = ROC(Closes[1], RocPeriod);
+                rsiHtf = RSI(Closes[1], RsiPeriod, 3);
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            int minBars = Math.Max(SmaPeriod, Math.Max(RocPeriod, RsiPeriod)) + 1;
+            if (CurrentBars[0] < minBars || CurrentBars[1] < minBars)
+                return;
+
+            // ── 30-minute series: set the bias ──
+            if (BarsInProgress == 1)
+            {
+                bool htfLong  = Closes[1][0] > smaHtf[0] && rocHtf[0] > 0 && rsiHtf[0] > 50
+                                && Volumes[1][0] >= Volumes[1][1];
+                bool htfShort = Closes[1][0] < smaHtf[0] && rocHtf[0] < 0 && rsiHtf[0] < 50
+                                && Volumes[1][0] >= Volumes[1][1];
+
+                if (htfLong && htfBias != 1)
+                {
+                    htfBias        = 1;
+                    ltfLastSignal  = 0;   // first 5-min LONG bar under the new bias counts
+                    pendingHtfMark = 1;
+                }
+                else if (htfShort && htfBias != -1)
+                {
+                    htfBias        = -1;
+                    ltfLastSignal  = 0;
+                    pendingHtfMark = -1;
+                }
+                return;
+            }
+
+            // ── 5-minute series (primary chart) ──
+            if (BarsInProgress != 0)
+                return;
+
+            bool canAlert = AlertOnHistorical || State == State.Realtime;
+            bool onChart  = ChartControl != null;   // false in Market Analyzer: skip drawing
+
+            Values[1][0] = 0;   // Match plot resets every bar
+
+            // Mark where the 30-min signal fired
+            if (pendingHtfMark != 0)
+            {
+                if (pendingHtfMark == 1)
+                {
+                    if (onChart) Draw.Diamond(this, "HtfL" + CurrentBar, false, 0, Low[0] - 4 * TickSize, Brushes.DodgerBlue);
+                    if (canAlert && AlertOnHigherTFSignal)
+                        Alert("HtfL" + CurrentBar, Priority.Medium,
+                            HigherTFMinutes + "m LONG fired — watching for 5m LONG signals",
+                            SoundPath(), 10, Brushes.Black, Brushes.DodgerBlue);
+                }
+                else
+                {
+                    if (onChart) Draw.Diamond(this, "HtfS" + CurrentBar, false, 0, High[0] + 4 * TickSize, Brushes.Orange);
+                    if (canAlert && AlertOnHigherTFSignal)
+                        Alert("HtfS" + CurrentBar, Priority.Medium,
+                            HigherTFMinutes + "m SHORT fired — watching for 5m SHORT signals",
+                            SoundPath(), 10, Brushes.Black, Brushes.Orange);
+                }
+                pendingHtfMark = 0;
+            }
+
+            // Light background tint showing the current 30-min bias
+            Values[0][0] = htfBias;
+
+            if (ShowBiasBackground && onChart)
+            {
+                if (htfBias == 1)
+                    BackBrush = new SolidColorBrush(Color.FromArgb(25, 0, 200, 0));
+                else if (htfBias == -1)
+                    BackBrush = new SolidColorBrush(Color.FromArgb(25, 220, 0, 0));
+            }
+
+            // 5-min signals (alternating on their own)
+            bool ltfLong  = Close[0] > sma5[0] && roc5[0] > 0 && rsi5[0] > 50 && Volume[0] >= Volume[1];
+            bool ltfShort = Close[0] < sma5[0] && roc5[0] < 0 && rsi5[0] < 50 && Volume[0] >= Volume[1];
+
+            if (ltfLong && ltfLastSignal != 1)
+            {
+                ltfLastSignal = 1;
+
+                if (htfBias == 1)
+                {
+                    Values[1][0] = 1;
+                    if (onChart) Draw.ArrowUp(this, "MatchL" + CurrentBar, false, 0, Low[0] - 2 * TickSize, Brushes.Lime);
+                    if (canAlert)
+                        Alert("MatchL" + CurrentBar, Priority.High,
+                            "MATCH LONG: " + HigherTFMinutes + "m LONG + 5m LONG",
+                            SoundPath(), 10, Brushes.Black, Brushes.Lime);
+                }
+            }
+            else if (ltfShort && ltfLastSignal != -1)
+            {
+                ltfLastSignal = -1;
+
+                if (htfBias == -1)
+                {
+                    Values[1][0] = -1;
+                    if (onChart) Draw.ArrowDown(this, "MatchS" + CurrentBar, false, 0, High[0] + 2 * TickSize, Brushes.Red);
+                    if (canAlert)
+                        Alert("MatchS" + CurrentBar, Priority.High,
+                            "MATCH SHORT: " + HigherTFMinutes + "m SHORT + 5m SHORT",
+                            SoundPath(), 10, Brushes.Black, Brushes.Red);
+                }
+            }
+        }
+
+        private string SoundPath()
+        {
+            return NinjaTrader.Core.Globals.InstallDir + @"sounds\" + AlertSound;
+        }
+
+        #region Properties
+        [Browsable(false)]
+        [XmlIgnore]
+        public Series<double> Bias
+        {
+            get { return Values[0]; }
+        }
+
+        [Browsable(false)]
+        [XmlIgnore]
+        public Series<double> Match
+        {
+            get { return Values[1]; }
+        }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Higher TF (minutes)", Description = "Higher timeframe that sets the bias", Order = 1, GroupName = "Parameters")]
+        public int HigherTFMinutes { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "SMA Period", Order = 2, GroupName = "Parameters")]
+        public int SmaPeriod { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "ROC Period", Order = 3, GroupName = "Parameters")]
+        public int RocPeriod { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "RSI Period", Order = 4, GroupName = "Parameters")]
+        public int RsiPeriod { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show Bias Background", Description = "Light green/red tint while the 30-min bias is long/short", Order = 5, GroupName = "Display")]
+        public bool ShowBiasBackground { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Alert On Higher TF Signal", Description = "Heads-up alert when the 30-min bias changes", Order = 6, GroupName = "Alerts")]
+        public bool AlertOnHigherTFSignal { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Alert On Historical", Description = "Fire alerts on historical bars too. Default: real-time only.", Order = 7, GroupName = "Alerts")]
+        public bool AlertOnHistorical { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Alert Sound", Description = "File name in the NinjaTrader 8 sounds folder", Order = 8, GroupName = "Alerts")]
+        public string AlertSound { get; set; }
+        #endregion
+    }
+}
+
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private SignalAlertMTF[] cacheSignalAlertMTF;
+		public SignalAlertMTF SignalAlertMTF(int higherTFMinutes, int smaPeriod, int rocPeriod, int rsiPeriod, bool showBiasBackground, bool alertOnHigherTFSignal, bool alertOnHistorical, string alertSound)
+		{
+			return SignalAlertMTF(Input, higherTFMinutes, smaPeriod, rocPeriod, rsiPeriod, showBiasBackground, alertOnHigherTFSignal, alertOnHistorical, alertSound);
+		}
+
+		public SignalAlertMTF SignalAlertMTF(ISeries<double> input, int higherTFMinutes, int smaPeriod, int rocPeriod, int rsiPeriod, bool showBiasBackground, bool alertOnHigherTFSignal, bool alertOnHistorical, string alertSound)
+		{
+			if (cacheSignalAlertMTF != null)
+				for (int idx = 0; idx < cacheSignalAlertMTF.Length; idx++)
+					if (cacheSignalAlertMTF[idx] != null && cacheSignalAlertMTF[idx].HigherTFMinutes == higherTFMinutes && cacheSignalAlertMTF[idx].SmaPeriod == smaPeriod && cacheSignalAlertMTF[idx].RocPeriod == rocPeriod && cacheSignalAlertMTF[idx].RsiPeriod == rsiPeriod && cacheSignalAlertMTF[idx].ShowBiasBackground == showBiasBackground && cacheSignalAlertMTF[idx].AlertOnHigherTFSignal == alertOnHigherTFSignal && cacheSignalAlertMTF[idx].AlertOnHistorical == alertOnHistorical && cacheSignalAlertMTF[idx].AlertSound == alertSound && cacheSignalAlertMTF[idx].EqualsInput(input))
+						return cacheSignalAlertMTF[idx];
+			return CacheIndicator<SignalAlertMTF>(new SignalAlertMTF(){ HigherTFMinutes = higherTFMinutes, SmaPeriod = smaPeriod, RocPeriod = rocPeriod, RsiPeriod = rsiPeriod, ShowBiasBackground = showBiasBackground, AlertOnHigherTFSignal = alertOnHigherTFSignal, AlertOnHistorical = alertOnHistorical, AlertSound = alertSound }, input, ref cacheSignalAlertMTF);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.SignalAlertMTF SignalAlertMTF(int higherTFMinutes, int smaPeriod, int rocPeriod, int rsiPeriod, bool showBiasBackground, bool alertOnHigherTFSignal, bool alertOnHistorical, string alertSound)
+		{
+			return indicator.SignalAlertMTF(Input, higherTFMinutes, smaPeriod, rocPeriod, rsiPeriod, showBiasBackground, alertOnHigherTFSignal, alertOnHistorical, alertSound);
+		}
+
+		public Indicators.SignalAlertMTF SignalAlertMTF(ISeries<double> input , int higherTFMinutes, int smaPeriod, int rocPeriod, int rsiPeriod, bool showBiasBackground, bool alertOnHigherTFSignal, bool alertOnHistorical, string alertSound)
+		{
+			return indicator.SignalAlertMTF(input, higherTFMinutes, smaPeriod, rocPeriod, rsiPeriod, showBiasBackground, alertOnHigherTFSignal, alertOnHistorical, alertSound);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.SignalAlertMTF SignalAlertMTF(int higherTFMinutes, int smaPeriod, int rocPeriod, int rsiPeriod, bool showBiasBackground, bool alertOnHigherTFSignal, bool alertOnHistorical, string alertSound)
+		{
+			return indicator.SignalAlertMTF(Input, higherTFMinutes, smaPeriod, rocPeriod, rsiPeriod, showBiasBackground, alertOnHigherTFSignal, alertOnHistorical, alertSound);
+		}
+
+		public Indicators.SignalAlertMTF SignalAlertMTF(ISeries<double> input , int higherTFMinutes, int smaPeriod, int rocPeriod, int rsiPeriod, bool showBiasBackground, bool alertOnHigherTFSignal, bool alertOnHistorical, string alertSound)
+		{
+			return indicator.SignalAlertMTF(input, higherTFMinutes, smaPeriod, rocPeriod, rsiPeriod, showBiasBackground, alertOnHigherTFSignal, alertOnHistorical, alertSound);
+		}
+	}
+}
+
+#endregion
